@@ -1,23 +1,24 @@
-# MemScope v1.0.3 - Memory Monitoring Addon for Ashita v4.3
+# MemScope v1.2.0 - Memory Monitoring Addon for Ashita v4.3
 
 A memory monitoring tool that tracks per-addon Lua memory, process memory, and provides growth analysis with historical trends.
 
 ## Features
 
 - **Process Memory Tracking** - Working set, page file, and peak usage via Windows APIs (FFI)
-- **Per-Addon Memory Breakdown** - Polling via `/addon list` capture with silent interception
-- **Historical Trends** - Ring buffer storage with configurable history (720 process samples, 120 per addon)
+- **Per-Addon Memory Breakdown** - Read straight from Ashita's `AddonManager` binding (byte resolution, no chat command)
+- **Historical Trends** - Configurable rolling history limit (1–180 minutes, default 60), backed by fixed-size ring buffers
 - **Growth Observation** - EMA (exponential moving average) of delta to observe sustained memory changes
 - **Spike Observation** - Informational alerts on sudden memory increases (% threshold + minimum absolute change)
 - **GC Monitoring** - Track garbage collection events and freed memory (this addon's Lua state only)
 - **ImGui Dashboard** - Real-time visualization with charts, sortable tables, and compact mode
+- **Zone Markers** - A gold line with the zone name on every chart where you changed zone, so a memory step can be tied to a zone; the export gets a `Zones` sheet
 - **Export to Excel** - Session data exported as `.xls` with multiple worksheet tabs
 - **Pre-allocated Buffers** - Ring buffers, object pools, cached chart data (zero per-frame allocation)
 
 ## Requirements
 
-- Ashita v4.3.0.2
-	- This release has only been tested with Ashita v4.3.0.2
+- Ashita v4.3.2.1
+	- This release has only been tested with Ashita v4.3.2.1
 
 ## Installation
 
@@ -38,9 +39,11 @@ A memory monitoring tool that tracks per-addon Lua memory, process memory, and p
 | `/memscope export` | Export session data to Excel (.xls) |
 | `/memscope gc` | Force garbage collection (this addon only) |
 | `/memscope trim` | Trim working set (shows actual vs inflated memory) |
+| `/memscope zones [on/off]` | Toggle zone-change markers on the charts (status with no argument) |
 | `/memscope alerts [on/off]` | Toggle growth/spike alerts |
+| `/memscope clear` | Remove all unloaded addons from tracking (same as the Clear Unloaded button) |
+| `/memscope remove <name>` | Remove one addon from tracking (same as right-click > Remove from tracking) |
 | `/memscope resetui` | Reset window size and position to defaults |
-| `/memscope debug` | Debug addon list capture (writes to debug.log) |
 | `/memscope help` | Show command help |
 
 ## File Structure
@@ -48,7 +51,7 @@ A memory monitoring tool that tracks per-addon Lua memory, process memory, and p
 ```
 memscope/
   memscope.lua   -- Entry point, events, commands, state, export
-  monitor.lua    -- FFI + /addon list capture + GC monitoring
+  monitor.lua    -- FFI + AddonManager binding reads + GC monitoring
   analysis.lua   -- Ring buffers, trend/growth/spike analysis, addon pool
   ui.lua         -- ImGui dashboard rendering
 ```
@@ -67,7 +70,7 @@ Export files are written to `config/addons/memscope/exports/` (created at runtim
 
 ### Lua Memory
 - MemScope's own Lua state memory (this addon only)
-- All loaded addons combined total (from `/addon list` — Lua-tracked memory only, see Data Accuracy below)
+- All loaded addons combined total (from the AddonManager binding — Lua-tracked memory only, see Data Accuracy below)
 - GC collection statistics (count and last freed amount — MemScope's own GC only)
 
 ### Addon Breakdown
@@ -87,9 +90,6 @@ Click any row for detailed stats and mini-chart. Right-click unloaded addons to 
 
 ### Compact Mode
 Minimal overlay showing just the working set bar, top 3 addons, and pause/expand buttons. Toggle via the Compact button or `/memscope compact`. Window size restores automatically when expanding back to full mode.
-
-### Reset UI
-Use the **Reset UI** button (bottom-right) or `/memscope resetui` to restore the window to its default size and position.
 
 ## Alert System
 
@@ -117,34 +117,21 @@ Export path: `config/addons/memscope/exports/memscope_<CharName>_YYYYMMDD_HHMMSS
 
 - **Session** - Metadata (date, duration, LAA status, system RAM) + addon summary table
 - **Process Timeline** - Full process memory history with timestamps
-- **Addons Timeline** - Wide format with one column per addon (all addons side-by-side)
+- **Addons Timeline** - Wide format, one row per poll timestamp, one column per addon (blank where an addon had no sample at that time)
 - **Per-Addon Tabs** - One tab per addon with metadata header, timeline, deltas, and change-from-start
 
-## Settings
+## Graph history retention
 
-Access via the **Settings** button in the dashboard:
+Use **Settings → Graph History → Graph History (minutes)** to keep at most 1–180 minutes of graph history (default **60 minutes**). This applies to process charts, the compact chart, addon detail charts, zone markers, and the history included in future exports. Lowering the limit discards older entries immediately; raising it allows new history to accumulate and cannot restore discarded samples.
 
-| Setting | Default | Range | Description |
-|---------|---------|-------|-------------|
-| Sample Interval | 5 sec | 1-30 | How often to collect process memory data |
-| Addon Poll Interval | 30 sec | 5-120 | How often to query per-addon memory via /addon list |
-| Show Process Memory | true | | Display process memory bars |
-| Show Addon Breakdown | true | | Display addon table |
-| Show Charts | true | | Display history charts |
-| Chart Height | 80 px | 40-150 | Height of chart widgets |
-| Enable Alerts | false | | Show growth/spike notifications in chat (off by default — most are false positives) |
-| Growth Threshold | 50.0 KB/s | 1-200 | Sustained growth rate for informational alert |
-| Spike Threshold | 100% | 25-200 | Sudden increase percentage for spike alert |
-| Spike Min Change | 512 KB | 64-2048 | Minimum absolute change for spike alert |
-| Auto GC Monitoring | true | | Track garbage collection events |
-| Show On Load | true | | Open window automatically when addon loads |
-| Background Opacity | 0.8 | 0-1 | Background transparency for compact mode (0 = fully transparent) |
-| Show Title Bar | true | | Show or hide the title bar in compact mode |
+History was already bounded by fixed buffers, not an ever-growing log. Those caps remain: **3,600 process samples, 600 samples per addon, and 64 zone markers**. Frequent sampling can fill a buffer before the selected time limit: at a one-second addon poll interval, addon history holds about ten minutes. No additional history is allocated to meet a longer time setting.
+
+Paused history stays frozen until monitoring resumes or you take a manual sample; changing the retention setting explicitly still applies immediately while paused. Current readings and session peak/minimum statistics remain available when graph samples expire. Already exported files are unchanged.
 
 ## Data Accuracy
 
 - Per-Addon Memory (Understated)
-	- The memory values from `/addon list` only reflect **Lua-tracked memory** — what the Lua VM allocates for tables, strings, functions, and other Lua objects. The following are **NOT included**:
+	- The per-addon memory values only reflect **Lua-tracked memory** — what the Lua VM allocates for tables, strings, functions, and other Lua objects. The following are **NOT included**:
 		- **FFI allocations** (`ffi.new`, `ffi.C.*` calls) — allocated outside the Lua GC
 		- **ImGui resources** — textures, fonts, draw lists managed by the Addons plugin
 		- **Manual C allocations** — anything allocated by native code on behalf of the addon
@@ -159,14 +146,9 @@ Access via the **Settings** button in the dashboard:
 
 ## Technical Notes
 
-### Addon List Capture
+### Per-Addon Memory Source
 
-Per-addon memory data comes from silently injecting `/addon list` and intercepting the chat output in the `text_in` event. The capture system:
-- Pre-allocates result buffer (no per-capture allocation)
-- Strips FFXI color codes before pattern matching
-- Uses `seen_data` flag to avoid premature footer detection from startup notifications
-- Timeout safety (2 seconds) prevents hanging on missed footer
-- Only blocks chat lines during active capture; normal addon notifications pass through
+Per-addon memory is read from the `AddonManager` binding that addons.dll installs into every addon's Lua state — `AddonManager:Count()`, `Get(i)` (0-based name), `GetMemoryUsage(name)` (bytes, as a number), `GetState(name)` (1 = running, 3 = loading). Measured 2026-09-07 with `addons/amprobe` on Ashita 4.3. Every poll is one synchronous walk of that list into a pre-allocated buffer: no chat command, no chat listener, byte resolution, and the inventory is complete by construction so an addon that disappears is marked Unloaded on the next poll. If a build ever lacks the binding, MemScope shows "AddonManager binding unavailable" and tracks process memory only.
 
 ### Memory Data Sources
 
@@ -176,58 +158,11 @@ Per-addon memory data comes from silently injecting `/addon list` and intercepti
 | Page File | K32GetProcessMemoryInfo (FFI) | Entire FFXI process |
 | System RAM | GlobalMemoryStatusEx (FFI) | System-wide |
 | Own Lua State | collectgarbage('count') | This addon's Lua VM only |
-| Per-Addon | /addon list capture | All loaded addons |
-
-### Performance Design
-- **Ring buffers**: O(1) push, fixed-size, no reallocation after init
-- **Object pool**: 64 pre-allocated addon tracking slots, no GC pressure
-- **Chart buffers**: Pre-allocated arrays filled in-place each frame
-- **Pre-allocated color constants**: Delta color tables (`delta_up`, `delta_down`, `delta_flat`) are module-level constants — avoids creating `{r,g,b,a}` tables per row at 60fps
-- **Action flags**: UI sets flags, d3d_present processes them (decouples rendering from logic)
-- **Safe text_in**: Never print() from text_in handler (causes recursive crash); uses debug buffer flushed from d3d_present
+| Per-Addon | `AddonManager:GetMemoryUsage(name)` (bytes) | All loaded addons |
 
 ## Version History
 
-### v1.0.3
-- Pre-allocated all ImGui size/position tables, style color tables, and row color constants (eliminates ~20 per-frame table allocations)
-- Removed dead `own_memory_kb` field from shared state
-- Removed stale `leak_threshold` migration cleanup from load handler
-- Added missing settings to README: Show On Load, Background Opacity, Show Title Bar
-- Added tooltips to all settings widgets and addon detail items (Chart Height, Show On Load, Enable Alerts, compact Pause/Resume, Current/Peak/Min/Samples)
-- Export: added pcall wrapping for guaranteed file handle cleanup on error (matches LootScope pattern)
-- Export: added character name to filename (`memscope_<CharName>_<timestamp>.xls`)
-- Export: added pcall at both call sites (d3d_present action flag + `/memscope export` command)
-- Fixed .gitignore to ignore entire `exports/` directory instead of only `*.xls`
-- Fixed README: export path now shows correct config directory location
-
-### v1.0.2
-- Pre-allocated delta color constants in addon table (eliminates per-row table creation at 60fps)
-- Fixed incorrect "Own Tracked" data source in README (non-existent API method removed)
-
-### v1.0.1
-- Renamed `leak_threshold` setting to `growth_threshold` (consistent with reframed "growth" language)
-- Added `Auto GC Monitoring` checkbox to Settings UI (was only configurable via settings file)
-- Added pool slot reclamation: removed addons free their tracking slot for reuse
-- Added pcall guard around text_in handler to prevent stuck reentrancy guard on error
-- Added missing state initializations (`force_export`, `remove_addon`, `session_start`)
-- Fixed unused pcall error variables, improved sort comparator naming
-
-### v1.0.0
-- Split into 4 files (memscope, monitor, analysis, ui)
-- Per-addon Lua memory tracking via /addon list capture with silent interception
-- Process memory monitoring via Windows FFI (working set, page file)
-- EMA trend analysis with growth/spike observation (informational alerts, disabled by default)
-- Data accuracy disclaimers throughout UI
-- Historical ring buffers (720 process samples, 120 per addon)
-- Compact overlay mode with automatic window size restore on expand
-- Pause/resume data collection
-- Export to Excel (.xls) with multiple worksheet tabs
-- Scrollable addon table (10-row max with frozen headers) with sorting and right-click context menu
-- Reset UI button and `/memscope resetui` command
-- Debug capture mode for troubleshooting
-- Pre-allocated chart buffers, action flag decoupling
-- Per-character settings via Ashita's settings module
-- Uses Ashita `chat` module for standard colored output
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Thanks
 

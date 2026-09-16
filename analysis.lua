@@ -1,5 +1,5 @@
 --[[
-    MemScope v1.0.3 - Analysis Engine
+    MemScope v1.2.0 - Analysis Engine
     Ring buffers, trend analysis, growth/spike observation, addon pool management.
 
     NOTE: Per-addon memory from /addon list only reflects Lua-tracked memory.
@@ -13,9 +13,10 @@ local analysis = {};
 -------------------------------------------------------------------------------
 -- Constants
 -------------------------------------------------------------------------------
-local HISTORY_SIZE = 720;
-local ADDON_HISTORY_SIZE = 120;
-local MAX_TRACKED_ADDONS = 64;
+local HISTORY_SIZE = 3600;        -- one hour at the 1 s minimum interval (was 720 = 1 h at 5 s)
+local ADDON_HISTORY_SIZE = 600;   -- ten minutes at 1 s; rings are allocated when a slot is first used
+local MAX_TRACKED_ADDONS = 256;   -- matches monitor MAX_CAPTURE; 35 addons was already past half of 64
+local ZONE_MARK_SIZE = 64;
 local MIN_SAMPLES_FOR_TREND = 3;
 local TREND_ALPHA = 0.3;  -- EMA weight: 0.3 = responsive, 0.1 = smooth
 local MIN_KB_SENTINEL = 999999;  -- Initial min_kb value (replaced on first real sample)
@@ -40,14 +41,59 @@ local state = nil;
 analysis.HISTORY_SIZE = HISTORY_SIZE;
 analysis.ADDON_HISTORY_SIZE = ADDON_HISTORY_SIZE;
 analysis.MAX_TRACKED_ADDONS = MAX_TRACKED_ADDONS;
+analysis.ZONE_MARK_SIZE = ZONE_MARK_SIZE;
 analysis.MIN_SAMPLES_FOR_TREND = MIN_SAMPLES_FOR_TREND;
 analysis.MIN_KB_SENTINEL = MIN_KB_SENTINEL;
+
+-- A time limit supplements the fixed sample caps; it never expands the rings.
+function analysis.history_minutes(value)
+    local n = tonumber(value);
+    if not n or n ~= n or n == math.huge or n == -math.huge then return 60; end
+    return math_max(1, math_min(180, math.floor(n)));
+end
+
+-- Remove the oldest entries in place; head stays the next write slot. Clear all
+-- parallel fields so exports cannot recover expired data through a stale slot.
+function analysis.prune_history(now, force)
+    if not state or not state.history then return; end
+    now = now or os_time();
+    local minutes = analysis.history_minutes(state.settings and state.settings.history_minutes);
+    if not force and state.history_pruned_at == now and state.history_pruned_minutes == minutes then return; end
+    state.history_pruned_at, state.history_pruned_minutes = now, minutes;
+    local cutoff = now - minutes * 60;
+    local h = state.history;
+    while h.count > 0 do
+        local idx = (h.head - h.count - 1) % HISTORY_SIZE + 1;
+        if h.timestamps[idx] >= cutoff then break; end
+        h.working_set[idx], h.pagefile[idx], h.addon_total[idx], h.timestamps[idx] = 0, 0, 0, 0;
+        h.count = h.count - 1;
+    end
+    for _, data in pairs(state.addons) do
+        while data.history_count > 0 do
+            local idx = (data.history_head - data.history_count - 1) % ADDON_HISTORY_SIZE + 1;
+            if data.history_ts[idx] >= cutoff then break; end
+            data.history[idx], data.history_ts[idx], data.history_seq[idx] = 0, 0, 0;
+            data.history_count = data.history_count - 1;
+        end
+        if data.history_count == 0 then
+            data.last_delta, data.trend_slope, data.alert_active = 0, 0, false;
+        end
+    end
+    while state.zone_mark_count > 0 do
+        local idx = (state.zone_mark_head - state.zone_mark_count - 1) % ZONE_MARK_SIZE + 1;
+        local m = state.zone_marks[idx];
+        if m.t >= cutoff then break; end
+        m.t, m.zone_id, m.name = 0, 0, '';
+        state.zone_mark_count = state.zone_mark_count - 1;
+    end
+end
 
 -------------------------------------------------------------------------------
 -- Initialization
 -------------------------------------------------------------------------------
 function analysis.init(shared_state)
     state = shared_state;
+    state.history_pruned_at, state.history_pruned_minutes = nil, nil;
 
     -- Sort state (tracked so prune_and_sort respects current sort)
     state.sort_col = 1;      -- default: Memory
@@ -87,18 +133,23 @@ function analysis.init(shared_state)
             min_kb = MIN_KB_SENTINEL,
             last_delta = 0,
             trend_slope = 0,
-            history = {},
+            history = nil,        -- three parallel rings (value / os.time() / poll seq), allocated on first use:
+            history_ts = nil,     -- 256 slots x 600 x 3 would be ~7 MB up front for a memory monitor
+            history_seq = nil,
             history_head = 1,
             history_count = 0,
             last_update = 0,
             alert_active = false,
         };
-        for j = 1, ADDON_HISTORY_SIZE do
-            state.addon_pool[i].history[j] = 0;
-        end
     end
 
     -- Alerts ring buffer
+    -- Zone markers: {t, zone_id, name} per zone change, drawn on the charts and exported
+    state.zone_marks = {};
+    state.zone_mark_head = 1;
+    state.zone_mark_count = 0;
+    for i = 1, ZONE_MARK_SIZE do state.zone_marks[i] = { t = 0, zone_id = 0, name = '' }; end
+
     state.alerts = {};
     state.alert_head = 1;
     state.alert_count = 0;
@@ -132,6 +183,13 @@ local function get_or_create_addon_data(name)
             return nil;
         end
 
+        if data.history == nil then
+            -- first use of this slot: allocate its rings once (never per frame, never per poll)
+            data.history, data.history_ts, data.history_seq = {}, {}, {};
+            for j = 1, ADDON_HISTORY_SIZE do
+                data.history[j] = 0; data.history_ts[j] = 0; data.history_seq[j] = 0;
+            end
+        end
         data.name = name;
         data.memory_kb = 0;
         data.status = 'Unknown';
@@ -176,7 +234,7 @@ local function add_alert(addon_name, alert_type, message)
 end
 
 local function check_addon_alerts(data)
-    if not state.settings.alerts_enabled then return; end
+    if not state.settings or not state.settings.alerts_enabled then return; end
 
     -- Growth observation (sustained increase)
     -- NOTE: LuaJIT jitting and normal Lua VM behavior can cause sustained growth
@@ -195,7 +253,10 @@ local function check_addon_alerts(data)
     -- Spike observation (requires both % threshold AND minimum absolute change)
     -- NOTE: LuaJIT hot-path compilation can cause legitimate memory jumps.
     if data.history_count >= 2 then
-        local prev_idx = (data.history_head - 2) % ADDON_HISTORY_SIZE + 1;
+        -- history_head was already advanced past the just-written current sample
+        -- (update_addon pushes then post-increments before calling this), so the
+        -- previous sample is at head-3 in this 1-based ring (head-2 is the current).
+        local prev_idx = (data.history_head - 3) % ADDON_HISTORY_SIZE + 1;
         local prev = data.history[prev_idx];
         if prev > 0 then
             local abs_change = data.memory_kb - prev;
@@ -213,7 +274,17 @@ end
 -------------------------------------------------------------------------------
 -- Public: Update addon tracking data
 -------------------------------------------------------------------------------
+-- One AddonManager read = one poll. Every sample written during it (including the
+-- unload zeros in prune_and_sort) carries this number, so the export can align rows by poll even
+-- when two polls land in the same os.time() second (recheck F11).
+function analysis.begin_poll()
+    analysis.prune_history();
+    state.poll_seq = (state.poll_seq or 0) + 1;
+    return state.poll_seq;
+end
+
 function analysis.update_addon(name, memory_kb, status_val)
+    analysis.prune_history();
     local data = get_or_create_addon_data(name);
     if not data then return; end
 
@@ -225,7 +296,7 @@ function analysis.update_addon(name, memory_kb, status_val)
     data.peak_kb = math_max(data.peak_kb, memory_kb);
     data.min_kb = math_min(data.min_kb, memory_kb);
 
-    if data.last_update > 0 then
+    if data.history_count > 0 and data.last_update > 0 then
         local dt = now - data.last_update;
         if dt > 0 then
             data.last_delta = (memory_kb - old_memory) / dt;
@@ -233,8 +304,10 @@ function analysis.update_addon(name, memory_kb, status_val)
     end
     data.last_update = now;
 
-    -- Push to per-addon history
+    -- Push to per-addon history (value + timestamp, parallel rings)
     data.history[data.history_head] = memory_kb;
+    data.history_ts[data.history_head] = now;
+    data.history_seq[data.history_head] = state.poll_seq or 0;
     data.history_head = data.history_head % ADDON_HISTORY_SIZE + 1;
     if data.history_count < ADDON_HISTORY_SIZE then
         data.history_count = data.history_count + 1;
@@ -249,9 +322,30 @@ function analysis.update_addon(name, memory_kb, status_val)
 end
 
 -------------------------------------------------------------------------------
+-- Public: Zone markers (ring of ZONE_MARK_SIZE; oldest overwritten)
+-------------------------------------------------------------------------------
+function analysis.push_zone_mark(t, zone_id, name)
+    local m = state.zone_marks[state.zone_mark_head];
+    m.t = t; m.zone_id = zone_id; m.name = name or '';
+    state.zone_mark_head = state.zone_mark_head % ZONE_MARK_SIZE + 1;
+    if state.zone_mark_count < ZONE_MARK_SIZE then state.zone_mark_count = state.zone_mark_count + 1; end
+end
+
+--- Iterate zone marks oldest -> newest: for i, m in analysis.zone_marks() do ... end
+function analysis.zone_marks()
+    local n, head, i = state.zone_mark_count, state.zone_mark_head, 0;
+    return function()
+        i = i + 1;
+        if i > n then return nil; end
+        return i, state.zone_marks[(head - n + i - 2) % ZONE_MARK_SIZE + 1];
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Public: Push to process memory history
 -------------------------------------------------------------------------------
 function analysis.push_history(ws_mb, pf_mb, addon_total_kb)
+    analysis.prune_history();
     local h = state.history;
     h.working_set[h.head] = ws_mb;
     h.pagefile[h.head] = pf_mb;
@@ -283,6 +377,8 @@ function analysis.prune_and_sort(current_names)
             data.last_delta = 0;
             -- Push 0 to history so the chart shows the unload event
             data.history[data.history_head] = 0;
+            data.history_ts[data.history_head] = os_time();
+            data.history_seq[data.history_head] = state.poll_seq or 0;
             data.history_head = data.history_head % ADDON_HISTORY_SIZE + 1;
             if data.history_count < ADDON_HISTORY_SIZE then
                 data.history_count = data.history_count + 1;
@@ -295,7 +391,7 @@ function analysis.prune_and_sort(current_names)
 end
 
 -------------------------------------------------------------------------------
--- Public: Sort addons by column (unloaded always at bottom)
+-- Public: Sort pinned addons first, then by column (unloaded last within each group)
 -- col_id: 0=Name, 1=Memory, 2=Status, 3=Delta, 4=Trend
 -- ascending: true = A-Z / low-high, false = Z-A / high-low
 -------------------------------------------------------------------------------
@@ -305,13 +401,40 @@ analysis.SORT_STATUS = 2;
 analysis.SORT_DELTA  = 3;
 analysis.SORT_TREND  = 4;
 
+-- Ashita's merge assigns missing nested tables by reference. Detach star preferences
+-- from defaults and other settings objects at each load/reset boundary.
+function analysis.copy_pins(pins)
+    local copy = {};
+    if type(pins) == 'table' then
+        for name, pinned in pairs(pins) do
+            if type(name) == 'string' and pinned == true then copy[name] = true; end
+        end
+    end
+    return copy;
+end
+
+function analysis.is_pinned(name)
+    local pins = state.settings and state.settings.pinned_addons;
+    return type(pins) == 'table' and pins[name] == true;
+end
+
+function analysis.toggle_pin(name)
+    if type(state.settings.pinned_addons) ~= 'table' then state.settings.pinned_addons = {}; end
+    state.settings.pinned_addons[name] = not analysis.is_pinned(name) or nil;
+    state.settings_save_requested = true;
+    -- Caller sorts after drawing the table, never while iterating its rows.
+end
+
 function analysis.sort_addons(col_id, ascending)
     table_sort(state.addon_order, function(a, b)
         local data_a = state.addons[a];
         local data_b = state.addons[b];
         if not data_a or not data_b then return false; end
 
-        -- Unloaded always at bottom regardless of sort
+        local a_pinned, b_pinned = analysis.is_pinned(a), analysis.is_pinned(b);
+        if a_pinned ~= b_pinned then return a_pinned; end
+
+        -- Within each group, unloaded addons stay below loaded ones.
         local a_loaded = data_a.status ~= 'Unloaded';
         local b_loaded = data_b.status ~= 'Unloaded';
         if a_loaded ~= b_loaded then
@@ -368,6 +491,23 @@ function analysis.remove_addon(name)
         end
     end
     state.addon_order = new_order;
+end
+
+-------------------------------------------------------------------------------
+-- Public: Remove all Unloaded addons from tracking (mirrors remove_addon)
+-------------------------------------------------------------------------------
+function analysis.clear_unloaded()
+    -- Collect first, since remove_addon rebuilds addon_order
+    local to_remove = {};
+    for _, name in ipairs(state.addon_order) do
+        local data = state.addons[name];
+        if data and data.status == 'Unloaded' then
+            to_remove[#to_remove + 1] = name;
+        end
+    end
+    for i = 1, #to_remove do
+        analysis.remove_addon(to_remove[i]);
+    end
 end
 
 -------------------------------------------------------------------------------
